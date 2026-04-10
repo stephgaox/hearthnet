@@ -53,6 +53,8 @@ CLAUDE.md
 # Internal planning docs
 deploy_plan.md
 implementation_plan.md
+CHANGELOG.md
+ROADMAP.md
 
 # Personal import scripts
 backend/assign_2022_accounts.py
