@@ -39,3 +39,16 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Personal data files
+*.xlsx
+*.xls
+
+# AI assistant config (personal, not for public repo)
+.claude/
+.impeccable.md
+CLAUDE.md
+
+# Internal planning docs
+deploy_plan.md
+implementation_plan.md
