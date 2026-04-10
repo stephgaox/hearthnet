@@ -103,7 +103,12 @@ export default function Dashboard({ year, month, viewMode }: Props) {
         setByAccountType(r.data.by_account_type ?? null)
         setMissingCCWarning(r.data.missing_cc_warning ?? false)
       })
+      getMonthlyContext(year, month, 6).then(r => setContextData(r.data))
+      getCCMonthly(year, month, 6).then(r => setCCMonthlyData(r.data))
+      getCCPaymentsByCard(year, month, 6).then(r => setCCPaymentsByCard(r.data))
     } else {
+      getCCMonthly(year).then(r => setCCMonthlyData(r.data))
+      getCCPaymentsByCard(year).then(r => setCCPaymentsByCard(r.data))
       Promise.all([getYearlyDashboard(year), getYearlyCategories(year)]).then(([yearly, cats]) => {
         setSummary(yearly.data.totals)
         setMonthlyData(yearly.data.months)
