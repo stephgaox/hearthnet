@@ -2,9 +2,51 @@ import base64
 import json
 import os
 import re
-from anthropic import Anthropic
 
-client = Anthropic()
+
+class AIUnavailableError(Exception):
+    """Raised when AI parsing is requested but no API key or SDK is available."""
+    pass
+
+
+_client = None
+
+
+def is_ai_available() -> bool:
+    """Check whether AI parsing can be used (SDK installed + key configured)."""
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        return False
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    return bool(key) and key != "your_anthropic_api_key_here"
+
+
+def _get_client():
+    """Lazy-initialize the Anthropic client. Raises AIUnavailableError if unavailable."""
+    global _client
+    if _client is not None:
+        return _client
+
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        raise AIUnavailableError(
+            "The Anthropic Python SDK is not installed. "
+            "To enable AI parsing, run: pip install anthropic"
+        )
+
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key or key == "your_anthropic_api_key_here":
+        raise AIUnavailableError(
+            "No Anthropic API key configured. "
+            "To enable AI parsing for scanned PDFs and images, "
+            "add ANTHROPIC_API_KEY to your .env file. "
+            "Get a key at https://console.anthropic.com/"
+        )
+
+    _client = Anthropic(api_key=key)
+    return _client
 
 CATEGORIES = [
     "Food & Dining",
@@ -84,7 +126,7 @@ def parse_image(file_path: str, media_type: str) -> list[dict]:
     with open(file_path, "rb") as f:
         image_data = base64.standard_b64encode(f.read()).decode("utf-8")
 
-    response = client.messages.create(
+    response = _get_client().messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=8096,
         system=SYSTEM_PROMPT,
@@ -130,7 +172,7 @@ def parse_pdf(file_path: str) -> list[dict]:
 
     all_transactions: list[dict] = []
     for chunk in chunks:
-        response = client.messages.create(
+        response = _get_client().messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=8096,
             system=SYSTEM_PROMPT,
@@ -166,7 +208,7 @@ def parse_csv(file_path: str) -> list[dict]:
 
     all_transactions: list[dict] = []
     for chunk in chunks:
-        response = client.messages.create(
+        response = _get_client().messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=8096,
             system=SYSTEM_PROMPT,

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from models import Account, Transaction
-from services.ai_parser import parse_file as parse_file_ai
+from services.ai_parser import AIUnavailableError, parse_file as parse_file_ai, is_ai_available
 from services.direct_parser import parse_file_direct
 from services.pdf_parser import parse_pdf_direct
 from services.account_detector import build_account_hint
@@ -101,6 +101,16 @@ async def parse_statement(file: UploadFile = File(...), db: Session = Depends(ge
         else:
             transactions = parse_file_ai(tmp_path, file.content_type or "text/plain")
             method = "ai"
+    except AIUnavailableError:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This file requires AI parsing (scanned PDF or image), "
+                "but no Anthropic API key is configured. "
+                "Please upload a CSV, Excel (.xlsx), or digital PDF instead — "
+                "or add ANTHROPIC_API_KEY to your .env file to enable AI parsing."
+            ),
+        )
     except Exception as e:
         print(f"[upload error] {type(e).__name__}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=422, detail=f"{type(e).__name__}: {e}")
