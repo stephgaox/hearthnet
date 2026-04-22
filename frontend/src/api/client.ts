@@ -8,6 +8,7 @@ import type {
   MonthlyDashboard,
   ParsedTransaction,
   Transaction,
+  User,
   YearlyDashboard,
   YearlyCategoryDashboard,
   AccountHint,
@@ -15,7 +16,76 @@ import type {
 
 const api = axios.create({ baseURL: '/api' })
 
-// Dashboard
+// ── Auth token management ─────────────────────────────────────────────────────
+
+export function setAuthToken(token: string | null) {
+  if (token) {
+    localStorage.setItem('auth_token', token)
+    api.defaults.headers.common['Authorization'] = `Bearer ${token}`
+  } else {
+    localStorage.removeItem('auth_token')
+    localStorage.removeItem('current_user')
+    delete api.defaults.headers.common['Authorization']
+  }
+}
+
+export function setCurrentUser(user: User | null) {
+  if (user) {
+    localStorage.setItem('current_user', JSON.stringify(user))
+  } else {
+    localStorage.removeItem('current_user')
+  }
+}
+
+export function getStoredUser(): User | null {
+  try {
+    const raw = localStorage.getItem('current_user')
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+// Restore token from localStorage on module init
+const savedToken = localStorage.getItem('auth_token')
+if (savedToken) {
+  api.defaults.headers.common['Authorization'] = `Bearer ${savedToken}`
+}
+
+// Dispatch event when a 401 is received so App.tsx can show the switcher.
+// Only fire auth:logout when there's an existing stored token — otherwise 401
+// is an expected response (wrong passcode during login, etc.) and should just
+// propagate as a normal error so the caller can display the right message.
+api.interceptors.response.use(
+  res => res,
+  error => {
+    if (error.response?.status === 401 && localStorage.getItem('auth_token')) {
+      setAuthToken(null)
+      window.dispatchEvent(new Event('auth:logout'))
+    }
+    return Promise.reject(error)
+  }
+)
+
+// ── User / auth endpoints ─────────────────────────────────────────────────────
+
+export const getUsers = () =>
+  api.get<User[]>('/users')
+
+export const loginUser = (userId: number, passcode?: string) =>
+  api.post<User>('/auth/login', { user_id: userId, passcode: passcode ?? '' })
+
+export const createUser = (name: string, passcode?: string, avatarColor?: string) =>
+  api.post<User>('/users', { name, passcode: passcode ?? '', avatar_color: avatarColor })
+
+export const updateUser = (id: number, data: { name?: string; passcode?: string; avatar_color?: string }) =>
+  api.patch<User>(`/users/${id}`, data)
+
+export const deleteUser = (id: number) =>
+  api.delete(`/users/${id}`)
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
 export const getMonthlyDashboard = (year: number, month: number) =>
   api.get<MonthlyDashboard>(`/dashboard/monthly?year=${year}&month=${month}`)
 
@@ -71,7 +141,8 @@ export const getCCPaymentsByCard = (year: number, month?: number, count = 6) =>
 export const getAvailableYears = () =>
   api.get<{ years: number[]; latest_year: number; latest_month: number }>('/dashboard/years')
 
-// Transactions
+// ── Transactions ──────────────────────────────────────────────────────────────
+
 export const getTransactions = (params: {
   year?: number
   month?: number
@@ -107,6 +178,8 @@ export const getSourceFiles = (account_id?: number) =>
     account_id !== undefined ? { params: { account_id } } : undefined
   )
 
+// ── Categories ────────────────────────────────────────────────────────────────
+
 export const getCategories = () =>
   api.get<Category[]>('/categories')
 
@@ -119,7 +192,8 @@ export const updateCategory = (id: number, data: { name?: string; color?: string
 export const deleteCategory = (id: number, reassignTo?: string) =>
   api.delete(`/categories/${id}`, reassignTo ? { params: { reassign_to: reassignTo } } : undefined)
 
-// Accounts
+// ── Accounts ──────────────────────────────────────────────────────────────────
+
 export const getAccounts = () =>
   api.get<Account[]>('/accounts')
 
@@ -135,7 +209,8 @@ export const updateAccount = (id: number, data: Partial<Account>) =>
 export const deleteAccount = (id: number) =>
   api.delete(`/accounts/${id}`)
 
-// Upload
+// ── Upload ────────────────────────────────────────────────────────────────────
+
 export const parseStatement = (file: File) => {
   const form = new FormData()
   form.append('file', file)

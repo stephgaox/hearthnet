@@ -8,9 +8,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from auth import get_current_user
 from database import get_db
-from models import Account, Transaction
-from services.ai_parser import AIUnavailableError, parse_file as parse_file_ai, is_ai_available
+from models import Account, Transaction, User
+from services.ai_parser import AIUnavailableError, parse_file as parse_file_ai
 from services.direct_parser import parse_file_direct
 from services.pdf_parser import parse_pdf_direct
 from services.account_detector import build_account_hint
@@ -18,22 +19,20 @@ from services.account_detector import build_account_hint
 router = APIRouter()
 
 
-def _apply_merchant_learning(transactions: list[dict], db: Session) -> list[dict]:
+def _apply_merchant_learning(transactions: list[dict], db: Session, user_id: int) -> list[dict]:
     """Override parser-assigned category with the user's most-recent correction
-    for the same merchant, based on description matching.
-
-    Only category is learned — type is always determined by the parser since
-    users only recategorize transactions, they don't change the type.
-    """
+    for the same merchant, scoped to the current user's transaction history."""
     for tx in transactions:
         desc_norm = " ".join(tx.get("description", "").lower().split())
         if not desc_norm:
             continue
 
-        # Pass 1: exact description match (case-insensitive), most recent first
         match = (
             db.query(Transaction.category)
-            .filter(func.lower(Transaction.description) == desc_norm)
+            .filter(
+                func.lower(Transaction.description) == desc_norm,
+                Transaction.user_id == user_id,
+            )
             .order_by(Transaction.created_at.desc())
             .first()
         )
@@ -41,13 +40,14 @@ def _apply_merchant_learning(transactions: list[dict], db: Session) -> list[dict
             tx["category"] = match[0]
             continue
 
-        # Pass 2: prefix match — first 20 chars handles slight variations
-        # (e.g. "WHOLE FOODS #123" vs "WHOLE FOODS #456")
         prefix = desc_norm[:20]
         if len(prefix) >= 8:
             match = (
                 db.query(Transaction.category)
-                .filter(func.lower(Transaction.description).startswith(prefix))
+                .filter(
+                    func.lower(Transaction.description).startswith(prefix),
+                    Transaction.user_id == user_id,
+                )
                 .order_by(Transaction.created_at.desc())
                 .first()
             )
@@ -55,6 +55,7 @@ def _apply_merchant_learning(transactions: list[dict], db: Session) -> list[dict
                 tx["category"] = match[0]
 
     return transactions
+
 
 DIRECT_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
@@ -64,8 +65,11 @@ def _use_direct(filename: str) -> bool:
 
 
 @router.post("/upload/parse")
-async def parse_statement(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Parse a file, return transactions + account hint + file hash for user to confirm."""
+async def parse_statement(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     filename = file.filename or ""
     suffix = os.path.splitext(filename)[1] or ".tmp"
 
@@ -74,10 +78,8 @@ async def parse_statement(file: UploadFile = File(...), db: Session = Depends(ge
         tmp.write(content)
         tmp_path = tmp.name
 
-    # Compute file hash for duplicate detection
     file_hash = hashlib.sha256(content).hexdigest()
 
-    # Read text for account detection (CSV/txt only)
     file_text = None
     if suffix.lower() in (".csv", ".txt"):
         try:
@@ -95,7 +97,6 @@ async def parse_statement(file: UploadFile = File(...), db: Session = Depends(ge
                 transactions = result
                 method = "pdf"
             else:
-                # Scanned/image PDF — fall back to AI
                 transactions = parse_file_ai(tmp_path, file.content_type or "application/pdf")
                 method = "ai"
         else:
@@ -117,7 +118,7 @@ async def parse_statement(file: UploadFile = File(...), db: Session = Depends(ge
     finally:
         os.unlink(tmp_path)
 
-    transactions = _apply_merchant_learning(transactions, db)
+    transactions = _apply_merchant_learning(transactions, db, current_user.id)
     account_hint = build_account_hint(filename, file_text)
 
     return {
@@ -129,21 +130,23 @@ async def parse_statement(file: UploadFile = File(...), db: Session = Depends(ge
     }
 
 
-def _get_or_create_account(db: Session, account_data: dict) -> Account:
-    """Find existing account by last4+institution or create a new one."""
+def _get_or_create_account(db: Session, account_data: dict, user_id: int) -> Account:
+    """Find existing account by last4+institution (for this user) or create a new one."""
     last4 = account_data.get("last4")
     institution = account_data.get("institution")
     name = account_data.get("name", "").strip()
 
-    # Try to find by last4 + institution (same card/account)
     if last4 and institution:
         existing = (
             db.query(Account)
-            .filter(Account.last4 == last4, Account.institution == institution)
+            .filter(
+                Account.last4 == last4,
+                Account.institution == institution,
+                Account.user_id == user_id,
+            )
             .first()
         )
         if existing:
-            # Update name/color if user changed it
             if name and existing.name != name:
                 existing.name = name
             if account_data.get("color"):
@@ -152,13 +155,13 @@ def _get_or_create_account(db: Session, account_data: dict) -> Account:
             db.refresh(existing)
             return existing
 
-    # Create new
     acct = Account(
         name=name or f"{institution or 'Account'} ...{last4 or ''}".strip(),
         type=account_data.get("type", "credit_card"),
         institution=institution,
         last4=last4,
         color=account_data.get("color", "#3b82f6"),
+        user_id=user_id,
     )
     db.add(acct)
     db.commit()
@@ -167,16 +170,22 @@ def _get_or_create_account(db: Session, account_data: dict) -> Account:
 
 
 @router.post("/upload/confirm")
-async def confirm_upload(payload: dict, db: Session = Depends(get_db)):
-    """Save confirmed transactions + account to the database."""
+async def confirm_upload(
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     transactions = payload.get("transactions", [])
     source_file = payload.get("source_file", "")
     file_hash = payload.get("file_hash")
-    account_data = payload.get("account")  # may be None for old callers
+    account_data = payload.get("account")
 
-    # Duplicate file check — if this exact file was already uploaded, refuse
+    # Duplicate file check scoped to this user
     if file_hash:
-        existing = db.query(Transaction).filter(Transaction.file_hash == file_hash).first()
+        existing = db.query(Transaction).filter(
+            Transaction.file_hash == file_hash,
+            Transaction.user_id == current_user.id,
+        ).first()
         if existing:
             return {"saved": 0, "duplicate": True}
 
@@ -184,17 +193,18 @@ async def confirm_upload(payload: dict, db: Session = Depends(get_db)):
     account_name = None
     direct_account_id = payload.get("account_id")
     if direct_account_id:
-        acct = db.query(Account).filter(Account.id == direct_account_id).first()
+        acct = db.query(Account).filter(
+            Account.id == direct_account_id,
+            Account.user_id == current_user.id,
+        ).first()
         if acct:
             account_id = acct.id
             account_name = acct.name
     elif account_data:
-        acct = _get_or_create_account(db, account_data)
+        acct = _get_or_create_account(db, account_data, current_user.id)
         account_id = acct.id
         account_name = acct.name
 
-    # Category → type mapping: ensures directional types are correct even if the
-    # UI payload loses the sign from the parser (e.g. after merchant-learning override).
     _CATEGORY_TYPE_MAP = {
         "CC Payments":      "transfer_out",
         "Payment Received": "transfer_in",
@@ -212,16 +222,14 @@ async def confirm_upload(payload: dict, db: Session = Depends(get_db)):
         amount = abs(float(t.get("amount", 0)))
         description = t.get("description", "")
         category = t.get("category", "Other")
-        # If the category unambiguously implies a direction, use it;
-        # otherwise trust whatever type the parser or merchant-learning assigned.
         tx_type = _CATEGORY_TYPE_MAP.get(category) or t.get("type", "expense")
 
-        # Per-transaction duplicate check: same date + description + amount + account
         already_exists = db.query(Transaction).filter(
             Transaction.date == tx_date,
             Transaction.description == description,
             Transaction.amount == amount,
             Transaction.account_id == account_id,
+            Transaction.user_id == current_user.id,
         ).first()
         if already_exists:
             skipped += 1
@@ -238,6 +246,7 @@ async def confirm_upload(payload: dict, db: Session = Depends(get_db)):
             source_file=source_file,
             file_hash=file_hash,
             notes=t.get("notes"),
+            user_id=current_user.id,
         )
         db.add(tx)
         saved += 1
@@ -247,8 +256,13 @@ async def confirm_upload(payload: dict, db: Session = Depends(get_db)):
 
 
 @router.get("/accounts")
-def list_accounts(db: Session = Depends(get_db)):
-    accounts = db.query(Account).order_by(Account.name).all()
+def list_accounts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    accounts = db.query(Account).filter(
+        Account.user_id == current_user.id
+    ).order_by(Account.name).all()
     return [
         {
             "id": a.id,

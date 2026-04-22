@@ -37,16 +37,61 @@ def _add_column_if_missing(conn, stmt: str):
         pass  # column already exists
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    try:
+        conn.execute(text(f"SELECT {column} FROM {table} LIMIT 1"))
+        return True
+    except Exception:
+        return False
+
+
+# ── Default category list ─────────────────────────────────────────────────────
+
+DEFAULT_CATEGORIES = [
+    ("Food & Dining",    "#c0522a", 0),
+    ("Groceries",        "#4a7c59", 1),
+    ("Kids & Childcare", "#c07838", 2),
+    ("Car",              "#5a7a8a", 3),
+    ("Entertainment",    "#7a5a82", 4),
+    ("Shopping",         "#b07030", 5),
+    ("Home",             "#7a5c3a", 6),
+    ("Subscriptions",    "#2a8a82", 7),
+    ("Medical",          "#9a4848", 8),
+    ("Education",        "#6b7a3e", 9),
+    ("Travel",           "#9a7248", 10),
+    ("Pet",              "#b88820", 11),
+    ("Bills & Utilities","#6a7888", 12),
+    ("Income",           "#357a52", 13),
+    ("Refund",           "#5a7a4a", 14),
+    ("Other",            "#a89268", 15),
+    ("Transfer",         "#8a9aaa", 16),
+    ("Withdraw",         "#8a5a3a", 17),
+    ("CC Payments",      "#5a7a9a", 18),
+    ("Payment Received", "#6a8872", 19),
+]
+
+
+def seed_user_categories(db, user_id: int):
+    """Seed the default category set for a given user (idempotent)."""
+    from models import Category as CatModel
+    for name, color, order in DEFAULT_CATEGORIES:
+        if not db.query(CatModel).filter(
+            CatModel.name == name, CatModel.user_id == user_id
+        ).first():
+            db.add(CatModel(name=name, color=color, sort_order=order, user_id=user_id))
+    db.commit()
+
+
 def create_tables():
-    from models import Account, Transaction, Category  # noqa: F401
+    from models import Account, Transaction, Category, User  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
-    # Safe migrations — run on every startup, silently skip if already applied
     with engine.connect() as conn:
+        # ── Legacy column migrations (pre-user era) ───────────────────────────
         _add_column_if_missing(conn, "ALTER TABLE transactions ADD COLUMN account_id INTEGER REFERENCES accounts(id)")
         _add_column_if_missing(conn, "ALTER TABLE transactions ADD COLUMN file_hash TEXT")
 
-        # Remove exact duplicates: same (date, description, amount, account_id) — keep lowest id
+        # Remove exact duplicates
         conn.execute(text("""
             DELETE FROM transactions
             WHERE id NOT IN (
@@ -56,11 +101,11 @@ def create_tables():
             )
         """))
 
-        # Rename "Transportation" → "Car" in existing data
+        # Rename "Transportation" → "Car"
         conn.execute(text("UPDATE transactions SET category = 'Car' WHERE category = 'Transportation'"))
         conn.execute(text("UPDATE categories SET name = 'Car' WHERE name = 'Transportation'"))
 
-        # Re-tone category colors to harmonious warm-earthy palette
+        # Re-tone category colors
         for name, color in [
             ("Food & Dining",    "#c0522a"),
             ("Groceries",        "#4a7c59"),
@@ -87,51 +132,65 @@ def create_tables():
                 "UPDATE categories SET color = :color WHERE name = :name"
             ), {"color": color, "name": name})
 
-        # Ensure all amounts are positive (abs value convention).
-        # Negative amounts are a parse artifact — type/category conveys direction.
+        # Ensure amounts are positive
         conn.execute(text("UPDATE transactions SET amount = ABS(amount) WHERE amount < 0"))
 
-        # Re-tone vivid legacy generic system defaults
+        # Re-tone legacy vivid defaults
         conn.execute(text("UPDATE accounts SET color = '#8a9aaa' WHERE color = '#3b82f6'"))
         conn.execute(text("UPDATE categories SET color = '#a89268' WHERE color = '#6b7280'"))
 
         conn.commit()
 
-    # Seed categories table if empty
-    from models import Category as CatModel
-    DEFAULT_CATEGORIES = [
-        ("Food & Dining",    "#c0522a", 0),  # brick orange-red — appetite
-        ("Groceries",        "#4a7c59", 1),  # forest green — fresh produce
-        ("Kids & Childcare", "#c07838", 2),  # warm copper — nurturing
-        ("Car",              "#5a7a8a", 3),  # steel blue-gray — automotive
-        ("Entertainment",    "#7a5a82", 4),  # plum-mauve — culture & leisure
-        ("Shopping",         "#b07030", 5),  # amber-copper — commerce
-        ("Home",             "#7a5c3a", 6),  # oak brown — dwelling
-        ("Subscriptions",    "#2a8a82", 7),  # deep teal — digital services
-        ("Medical",          "#9a4848", 8),  # dusty crimson — health (distinct from Food)
-        ("Education",        "#6b7a3e", 9),  # olive green — learning
-        ("Travel",           "#9a7248", 10), # warm sand — wanderlust
-        ("Pet",              "#b88820", 11), # warm gold — animal companions
-        ("Bills & Utilities","#6a7888", 12), # slate blue-gray — utilities
-        ("Income",           "#357a52", 13), # deep forest — money in (distinct from Groceries)
-        ("Refund",           "#5a7a4a", 14), # sage green — credit
-        ("Other",            "#a89268", 15), # light sienna — catchall
-    ]
+        # ── Multi-user migration ───────────────────────────────────────────────
+
+        # 1. Ensure the users table has a Default user (id=1)
+        default_user_exists = conn.execute(
+            text("SELECT id FROM users LIMIT 1")
+        ).fetchone()
+        if not default_user_exists:
+            conn.execute(text(
+                "INSERT INTO users (id, name, avatar_color) VALUES (1, 'Default', '#5a7a8a')"
+            ))
+            conn.commit()
+
+        # 2. Add user_id to accounts (simple ALTER — no unique constraint issue)
+        if not _column_exists(conn, "accounts", "user_id"):
+            conn.execute(text("ALTER TABLE accounts ADD COLUMN user_id INTEGER REFERENCES users(id) DEFAULT 1"))
+            conn.execute(text("UPDATE accounts SET user_id = 1 WHERE user_id IS NULL"))
+            conn.commit()
+
+        # 3. Add user_id to transactions
+        if not _column_exists(conn, "transactions", "user_id"):
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INTEGER REFERENCES users(id) DEFAULT 1"))
+            conn.execute(text("UPDATE transactions SET user_id = 1 WHERE user_id IS NULL"))
+            conn.commit()
+
+        # 4. Recreate categories table to add user_id + composite unique(name, user_id).
+        #    The old table had a single-column UNIQUE on name, which would block multiple
+        #    users from having the same category names.
+        if not _column_exists(conn, "categories", "user_id"):
+            conn.execute(text("""
+                CREATE TABLE categories_new (
+                    id       INTEGER PRIMARY KEY,
+                    user_id  INTEGER REFERENCES users(id),
+                    name     VARCHAR(100) NOT NULL,
+                    color    VARCHAR(7)   NOT NULL DEFAULT '#a89268',
+                    sort_order INTEGER    DEFAULT 0,
+                    created_at DATETIME   DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(name, user_id)
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO categories_new (id, user_id, name, color, sort_order, created_at)
+                SELECT id, 1, name, color, sort_order, created_at FROM categories
+            """))
+            conn.execute(text("DROP TABLE categories"))
+            conn.execute(text("ALTER TABLE categories_new RENAME TO categories"))
+            conn.commit()
+
+    # ── Seed categories for Default user if missing ───────────────────────────
     seed_db = SessionLocal()
     try:
-        if seed_db.query(CatModel).count() == 0:
-            for name, color, order in DEFAULT_CATEGORIES:
-                seed_db.add(CatModel(name=name, color=color, sort_order=order))
-            seed_db.commit()
-        # Always ensure Transfer and Withdraw exist for existing DBs
-        for name, color, order in [
-            ("Transfer",         "#8a9aaa", 16), # cool blue-gray — neutral movement
-            ("Withdraw",         "#8a5a3a", 17), # warm sienna — money out (fits palette)
-            ("CC Payments",      "#5a7a9a", 18), # muted navy — payment
-            ("Payment Received", "#6a8872", 19), # muted green-gray — incoming (distinct from Transfer)
-        ]:
-            if not seed_db.query(CatModel).filter(CatModel.name == name).first():
-                seed_db.add(CatModel(name=name, color=color, sort_order=order))
-        seed_db.commit()
+        seed_user_categories(seed_db, user_id=1)
     finally:
         seed_db.close()

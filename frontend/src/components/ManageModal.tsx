@@ -33,8 +33,13 @@ export default function ManageModal({ onClose, onChanged }: Props) {
   const [newCat, setNewCat] = useState({ name: '', color: '#a67c52' })
   const [addingCat, setAddingCat] = useState(false)
 
-  // Inline name editing
-  const [editingId, setEditingId] = useState<{ type: 'account' | 'category'; id: number } | null>(null)
+  // Inline account editing (full form)
+  const [editingAcctId, setEditingAcctId] = useState<number | null>(null)
+  const [editingAcct, setEditingAcct] = useState({ name: '', type: 'credit_card', last4: '' })
+  const [savingAcct, setSavingAcct] = useState(false)
+
+  // Inline category name editing
+  const [editingId, setEditingId] = useState<{ type: 'category'; id: number } | null>(null)
   const [editingName, setEditingName] = useState('')
 
   // Merge confirmation (rename to existing name)
@@ -123,8 +128,31 @@ export default function ManageModal({ onClose, onChanged }: Props) {
   const apiErr = (e: unknown) =>
     (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'An error occurred'
 
-  // Account actions
-  const startEditing = (type: 'account' | 'category', id: number, name: string) => {
+  // Account inline edit handlers
+  const startEditingAcct = (a: Account) => {
+    setEditingAcctId(a.id)
+    setEditingAcct({ name: a.name, type: a.type, last4: a.last4 ?? '' })
+  }
+
+  const commitEditAcct = async () => {
+    if (editingAcctId === null) return
+    const name = editingAcct.name.trim()
+    if (!name) { setEditingAcctId(null); return }
+    setSavingAcct(true)
+    try {
+      const res = await updateAccount(editingAcctId, {
+        name,
+        type: editingAcct.type as Account['type'],
+        last4: editingAcct.last4.trim() || '',
+      })
+      setAccounts(prev => prev.map(a => a.id === editingAcctId ? res.data : a).sort((a, b) => a.name.localeCompare(b.name)))
+      onChanged()
+    } catch (e) { setError(apiErr(e)) }
+    finally { setSavingAcct(false); setEditingAcctId(null) }
+  }
+
+  // Category inline name editing
+  const startEditing = (type: 'category', id: number, name: string) => {
     setEditingId({ type, id })
     setEditingName(name)
   }
@@ -134,30 +162,22 @@ export default function ManageModal({ onClose, onChanged }: Props) {
     const name = editingName.trim()
     if (!name) { setEditingId(null); return }
 
-    if (editingId.type === 'category') {
-      const existing = categories.find(c => c.name.toLowerCase() === name.toLowerCase() && c.id !== editingId.id)
-      const current = categories.find(c => c.id === editingId.id)
-      if (existing && current) {
-        // Would merge — ask user to confirm
-        setMergeConfirm({ from: current, to: existing })
-        setEditingId(null)
-        return
-      }
+    const existing = categories.find(c => c.name.toLowerCase() === name.toLowerCase() && c.id !== editingId.id)
+    const current = categories.find(c => c.id === editingId.id)
+    if (existing && current) {
+      setMergeConfirm({ from: current, to: existing })
+      setEditingId(null)
+      return
     }
 
     try {
-      if (editingId.type === 'account') {
-        const res = await updateAccount(editingId.id, { name })
-        setAccounts(prev => prev.map(a => a.id === editingId.id ? { ...a, name: res.data.name } : a).sort((a, b) => a.name.localeCompare(b.name)))
+      const oldName = categories.find(c => c.id === editingId.id)?.name ?? ''
+      const res = await updateCategory(editingId.id, { name })
+      if ((res.data as { merged?: boolean }).merged) {
+        setCategories(prev => prev.filter(c => c.id !== editingId.id).sort((a, b) => a.name.localeCompare(b.name)))
       } else {
-        const oldName = categories.find(c => c.id === editingId.id)?.name ?? ''
-        const res = await updateCategory(editingId.id, { name })
-        if ((res.data as { merged?: boolean }).merged) {
-          setCategories(prev => prev.filter(c => c.id !== editingId.id).sort((a, b) => a.name.localeCompare(b.name)))
-        } else {
-          setCategories(prev => prev.map(c => c.id === editingId.id ? { ...c, name: res.data.name } : c).sort((a, b) => a.name.localeCompare(b.name)))
-          pushUndo({ kind: 'rename', id: editingId.id, oldName, newName: name })
-        }
+        setCategories(prev => prev.map(c => c.id === editingId.id ? { ...c, name: res.data.name } : c).sort((a, b) => a.name.localeCompare(b.name)))
+        pushUndo({ kind: 'rename', id: editingId.id, oldName, newName: name })
       }
       onChanged()
     } catch (e) { setError(apiErr(e)) }
@@ -309,7 +329,7 @@ export default function ManageModal({ onClose, onChanged }: Props) {
         {/* Tabs */}
         <div className="flex border-b border-surface-border">
           {(['accounts', 'categories'] as Tab[]).map(t => (
-            <button key={t} onClick={() => { setTab(t); setError('') }}
+            <button key={t} onClick={() => { setTab(t); setError(''); setEditingAcctId(null) }}
               className={`flex-1 py-2.5 text-sm font-medium transition-colors ${tab === t
                 ? 'border-b-2 border-primary text-primary'
                 : 'text-text-muted hover:text-text'}`}>
@@ -339,38 +359,77 @@ export default function ManageModal({ onClose, onChanged }: Props) {
             <div>
               <ul className="divide-y divide-surface-border">
                 {accounts.map(a => (
-                  <li key={a.id} className="flex items-center gap-3 px-5 py-3 hover:bg-surface-hover">
-                    <ColorPicker value={a.color} onChange={color => handleAcctColor(a.id, color)} />
-                    <div className="flex-1 min-w-0">
-                      {editingId?.type === 'account' && editingId.id === a.id ? (
-                        <input
-                          autoFocus
-                          className="text-sm font-medium text-text border border-primary rounded px-1.5 py-0.5 w-full focus:outline-none focus:ring-2 focus:ring-primary bg-surface-card"
-                          value={editingName}
-                          onChange={e => setEditingName(e.target.value)}
-                          onBlur={commitEdit}
-                          onKeyDown={e => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') setEditingId(null) }}
-                        />
-                      ) : (
-                        <p className="text-sm font-medium text-text truncate cursor-pointer hover:text-primary transition-colors"
-                          onClick={() => startEditing('account', a.id, a.name)}
-                          title="Click to rename">
+                  <li key={a.id} className="flex flex-col">
+                    {/* Row */}
+                    <div className={`flex items-center gap-3 px-5 py-3 transition-colors ${editingAcctId === a.id ? 'bg-surface' : 'hover:bg-surface-hover'}`}>
+                      <ColorPicker value={a.color} onChange={color => handleAcctColor(a.id, color)} />
+                      <button
+                        className="flex-1 min-w-0 text-left group"
+                        onClick={() => editingAcctId === a.id ? setEditingAcctId(null) : startEditingAcct(a)}
+                        aria-expanded={editingAcctId === a.id}
+                      >
+                        <p className="text-sm font-medium text-text truncate group-hover:text-primary transition-colors">
                           {a.name}
                           {a.last4 && <span className="text-text-faint font-normal"> ···{a.last4}</span>}
                         </p>
-                      )}
-                      <p className="text-xs text-text-faint">
-                        {a.type === 'credit_card' ? 'Credit Card' : a.type === 'investment' ? 'Investment' : 'Bank Account'}
-                        {a.institution ? ` · ${a.institution}` : ''}
-                      </p>
+                        <p className="text-xs text-text-faint">
+                          {a.type === 'credit_card' ? 'Credit Card' : a.type === 'investment' ? 'Investment' : 'Bank Account'}
+                          {a.institution ? ` · ${a.institution}` : ''}
+                          <span className="ml-1 text-primary opacity-0 group-hover:opacity-100 transition-opacity">· edit</span>
+                        </p>
+                      </button>
+                      <button onClick={() => handleAcctDelete(a.id)}
+                        className="p-1.5 text-text-faint hover:text-expense hover:bg-expense-light rounded-lg transition-colors"
+                        aria-label={`Delete account ${a.name}`}>
+                        <svg aria-hidden="true" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
                     </div>
-                    <button onClick={() => handleAcctDelete(a.id)}
-                      className="p-1.5 text-text-faint hover:text-expense hover:bg-expense-light rounded-lg transition-colors"
-                      aria-label={`Delete account ${a.name}`}>
-                      <svg aria-hidden="true" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                    </button>
+
+                    {/* Inline edit form */}
+                    {editingAcctId === a.id && (
+                      <div className="mx-4 mb-3 p-3 bg-surface-card border border-surface-border rounded-xl space-y-3">
+                        <input
+                          autoFocus
+                          type="text"
+                          value={editingAcct.name}
+                          onChange={e => setEditingAcct(v => ({ ...v, name: e.target.value }))}
+                          placeholder="Account name"
+                          maxLength={100}
+                          className="w-full text-sm border border-surface-border rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary bg-surface text-text"
+                        />
+                        <div className="flex gap-2">
+                          <div className="flex rounded-lg border border-surface-border overflow-hidden text-xs flex-1">
+                            {([['credit_card', '💳 Credit'], ['bank_account', '🏦 Bank'], ['investment', '📈 Invest']] as const).map(([val, label]) => (
+                              <button key={val} type="button"
+                                onClick={() => setEditingAcct(v => ({ ...v, type: val }))}
+                                className={`flex-1 py-1.5 font-medium transition-colors ${editingAcct.type === val ? 'bg-primary text-white' : 'bg-surface-card text-text-muted hover:bg-surface-hover'}`}>
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                          <input
+                            type="text"
+                            placeholder="Last 4"
+                            maxLength={4}
+                            value={editingAcct.last4}
+                            onChange={e => setEditingAcct(v => ({ ...v, last4: e.target.value.replace(/\D/g, '').slice(0, 4) }))}
+                            className="w-16 text-sm border border-surface-border rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary bg-surface text-text font-mono tracking-widest"
+                          />
+                        </div>
+                        <div className="flex gap-2">
+                          <button type="button" onClick={() => setEditingAcctId(null)}
+                            className="flex-1 py-1.5 rounded-lg text-xs text-text-muted border border-surface-border hover:bg-surface-hover transition-colors">
+                            Cancel
+                          </button>
+                          <button type="button" onClick={commitEditAcct} disabled={savingAcct || !editingAcct.name.trim()}
+                            className="flex-1 py-1.5 rounded-lg text-xs font-semibold bg-primary text-white hover:bg-primary-hover disabled:opacity-50 transition-colors">
+                            {savingAcct ? 'Saving…' : 'Save'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </li>
                 ))}
                 {accounts.length === 0 && (

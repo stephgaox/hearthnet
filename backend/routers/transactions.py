@@ -5,8 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from auth import get_current_user
 from database import get_db
-from models import Transaction
+from models import Transaction, User
 from schemas import TransactionCreate, TransactionOut, TransactionUpdate
 
 router = APIRouter()
@@ -26,8 +27,11 @@ class ReclassifyRequest(BaseModel):
 
 
 @router.get("/transactions/source-files")
-def list_source_files(account_id: Optional[int] = Query(None), db: Session = Depends(get_db)):
-    """Return distinct uploaded files (file_hash + source_file name + count), optionally filtered by account."""
+def list_source_files(
+    account_id: Optional[int] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     from sqlalchemy import func
     q = (
         db.query(
@@ -37,7 +41,7 @@ def list_source_files(account_id: Optional[int] = Query(None), db: Session = Dep
             func.min(Transaction.date).label("min_date"),
             func.max(Transaction.date).label("max_date"),
         )
-        .filter(Transaction.file_hash.isnot(None))
+        .filter(Transaction.file_hash.isnot(None), Transaction.user_id == current_user.id)
     )
     if account_id is not None:
         q = q.filter(Transaction.account_id == account_id)
@@ -60,20 +64,25 @@ def list_source_files(account_id: Optional[int] = Query(None), db: Session = Dep
 
 
 @router.delete("/transactions/all")
-def delete_all_transactions(db: Session = Depends(get_db)):
-    """Delete every transaction. Irreversible. Returns count deleted."""
-    count = db.query(Transaction).count()
-    db.query(Transaction).delete(synchronize_session=False)
+def delete_all_transactions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    count = db.query(Transaction).filter(Transaction.user_id == current_user.id).count()
+    db.query(Transaction).filter(Transaction.user_id == current_user.id).delete(synchronize_session=False)
     db.commit()
     return {"deleted": count}
 
 
 @router.delete("/transactions/bulk")
-def bulk_delete(req: BulkDeleteRequest, db: Session = Depends(get_db)):
-    """Delete a list of transaction IDs in one query."""
+def bulk_delete(
+    req: BulkDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     deleted = (
         db.query(Transaction)
-        .filter(Transaction.id.in_(req.ids))
+        .filter(Transaction.id.in_(req.ids), Transaction.user_id == current_user.id)
         .delete(synchronize_session=False)
     )
     db.commit()
@@ -81,11 +90,14 @@ def bulk_delete(req: BulkDeleteRequest, db: Session = Depends(get_db)):
 
 
 @router.delete("/transactions/by-file")
-def delete_by_file(req: FileDeleteRequest, db: Session = Depends(get_db)):
-    """Delete all transactions belonging to a specific uploaded file."""
+def delete_by_file(
+    req: FileDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     deleted = (
         db.query(Transaction)
-        .filter(Transaction.file_hash == req.file_hash)
+        .filter(Transaction.file_hash == req.file_hash, Transaction.user_id == current_user.id)
         .delete(synchronize_session=False)
     )
     db.commit()
@@ -93,11 +105,14 @@ def delete_by_file(req: FileDeleteRequest, db: Session = Depends(get_db)):
 
 
 @router.patch("/transactions/reclassify")
-def reclassify_transactions(req: ReclassifyRequest, db: Session = Depends(get_db)):
-    """Bulk move all transactions from one category name to another."""
+def reclassify_transactions(
+    req: ReclassifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     updated = (
         db.query(Transaction)
-        .filter(Transaction.category == req.from_category)
+        .filter(Transaction.category == req.from_category, Transaction.user_id == current_user.id)
         .update({"category": req.to_category}, synchronize_session=False)
     )
     db.commit()
@@ -111,9 +126,10 @@ def list_transactions(
     category: Optional[str] = Query(None),
     account_id: Optional[int] = Query(None),
     file_hash: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    q = db.query(Transaction)
+    q = db.query(Transaction).filter(Transaction.user_id == current_user.id)
     if file_hash:
         q = q.filter(Transaction.file_hash == file_hash)
     else:
@@ -133,39 +149,45 @@ def list_transactions(
 
 
 @router.post("/transactions", response_model=TransactionOut)
-def create_transaction(tx: TransactionCreate, db: Session = Depends(get_db)):
-    obj = Transaction(**tx.model_dump())
+def create_transaction(
+    tx: TransactionCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    obj = Transaction(**tx.model_dump(), user_id=current_user.id)
     db.add(obj)
     db.commit()
     db.refresh(obj)
     return obj
 
 
-# When a user recategorizes to a transfer-class category, infer the correct
-# directional type rather than collapsing everything to a generic "transfer".
 _CATEGORY_TYPE_MAP = {
-    "CC Payments":       "transfer_out",   # bank paying a CC bill — always outgoing
-    "Payment Received":  "transfer_in",    # CC receiving a payment — always incoming
-    "Withdraw":          "transfer_out",   # cash withdrawal — always outgoing
-    "Transfer":          None,             # plain transfer — preserve existing type
+    "CC Payments":       "transfer_out",
+    "Payment Received":  "transfer_in",
+    "Withdraw":          "transfer_out",
+    "Transfer":          None,
 }
 
 
 @router.patch("/transactions/{tx_id}", response_model=TransactionOut)
-def update_transaction(tx_id: int, tx: TransactionUpdate, db: Session = Depends(get_db)):
-    obj = db.query(Transaction).filter(Transaction.id == tx_id).first()
+def update_transaction(
+    tx_id: int,
+    tx: TransactionUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    obj = db.query(Transaction).filter(
+        Transaction.id == tx_id, Transaction.user_id == current_user.id
+    ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Transaction not found")
     data = tx.model_dump(exclude_unset=True)
     for field, value in data.items():
         setattr(obj, field, value)
-    # If category implies a direction, set type accordingly (only when category changed
-    # and the caller didn't explicitly supply a type override).
     if "category" in data and "type" not in data and obj.category in _CATEGORY_TYPE_MAP:
         inferred = _CATEGORY_TYPE_MAP[obj.category]
         if inferred is not None:
             obj.type = inferred
-    # Amounts are always stored positive.
     if obj.amount is not None and obj.amount < 0:
         obj.amount = abs(obj.amount)
     db.commit()
@@ -174,12 +196,16 @@ def update_transaction(tx_id: int, tx: TransactionUpdate, db: Session = Depends(
 
 
 @router.delete("/transactions/{tx_id}")
-def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
-    obj = db.query(Transaction).filter(Transaction.id == tx_id).first()
+def delete_transaction(
+    tx_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    obj = db.query(Transaction).filter(
+        Transaction.id == tx_id, Transaction.user_id == current_user.id
+    ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Transaction not found")
     db.delete(obj)
     db.commit()
     return {"deleted": True}
-
-

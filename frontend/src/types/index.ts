@@ -1,3 +1,11 @@
+export interface User {
+  id: number
+  name: string
+  avatar_color: string
+  has_passcode: boolean
+  token?: string
+}
+
 export interface Category {
   id: number
   name: string

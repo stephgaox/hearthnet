@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
-import { getAccountDateRanges, getAccounts, getAvailableYears } from './api/client'
-import type { Account } from './types'
+import { getAccountDateRanges, getAccounts, getAvailableYears, getStoredUser, setAuthToken, setCurrentUser } from './api/client'
+import type { Account, User } from './types'
 import Dashboard from './components/Dashboard'
+import EditProfileModal from './components/EditProfileModal'
 import ManageModal from './components/ManageModal'
 import StatementsView from './components/StatementsView'
 import UploadModal from './components/UploadModal'
+import UserSwitcher from './components/UserSwitcher'
 
 const MONTH_NAMES = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -23,15 +25,47 @@ function fmtDateRange(min: string, max: string): string {
   return `${m1} ${y1} – ${m2} ${y2}`
 }
 
+function getInitials(name: string) {
+  return name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase()
+}
+
 type AppView = { mode: 'dashboard' } | { mode: 'statements'; account: Account }
 
 export default function App() {
   const today = new Date()
+
+  // ── Auth state ──────────────────────────────────────────────────────────────
+  const [currentUser, setCurrentUserState] = useState<User | null>(() => {
+    const stored = getStoredUser()
+    const token = localStorage.getItem('auth_token')
+    return stored && token ? stored : null
+  })
+
+  // Listen for 401 events dispatched by the Axios interceptor
+  useEffect(() => {
+    const onLogout = () => setCurrentUserState(null)
+    window.addEventListener('auth:logout', onLogout)
+    return () => window.removeEventListener('auth:logout', onLogout)
+  }, [])
+
+  function handleLogin(user: User) {
+    setCurrentUserState(user)
+  }
+
+  function handleSwitchUser() {
+    setAuthToken(null)
+    setCurrentUser(null)
+    setCurrentUserState(null)
+  }
+
+  // ── Dashboard state ─────────────────────────────────────────────────────────
   const [year, setYear] = useState(today.getFullYear())
   const [month, setMonth] = useState(today.getMonth() + 1)
   const [initialDateSet, setInitialDateSet] = useState(false)
   const [showUpload, setShowUpload] = useState(false)
   const [showManage, setShowManage] = useState(false)
+  const [showEditProfile, setShowEditProfile] = useState(false)
+  const [avatarMenuOpen, setAvatarMenuOpen] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
   const [availableYears, setAvailableYears] = useState<number[]>([today.getFullYear()])
   const [viewMode, setViewMode] = useState<'month' | 'year'>('month')
@@ -40,7 +74,6 @@ export default function App() {
     return saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches
   })
 
-  // Scroll-to-top button
   const [showScrollTop, setShowScrollTop] = useState(false)
   useEffect(() => {
     const onScroll = () => setShowScrollTop(window.scrollY > 400)
@@ -48,7 +81,6 @@ export default function App() {
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
 
-  // Sidebar + navigation
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [accounts, setAccounts] = useState<Account[]>([])
   const [dateRanges, setDateRanges] = useState<Record<number, DateRange>>({})
@@ -60,11 +92,11 @@ export default function App() {
   }, [isDark])
 
   useEffect(() => {
+    if (!currentUser) return
     getAvailableYears().then((r) => {
       const years = r.data.years
       if (years.length) {
         setAvailableYears(years)
-        // On first load, jump to the latest month that actually has data
         if (!initialDateSet) {
           setYear(r.data.latest_year ?? years[0])
           setMonth(r.data.latest_month ?? today.getMonth() + 1)
@@ -78,7 +110,7 @@ export default function App() {
       r.data.forEach(d => { map[d.account_id] = { min_date: d.min_date, max_date: d.max_date } })
       setDateRanges(map)
     })
-  }, [refreshKey])
+  }, [refreshKey, currentUser])
 
   const prevMonth = () => {
     if (month === 1) { setMonth(12); setYear(y => y - 1) }
@@ -105,13 +137,17 @@ export default function App() {
   }
 
   const goToDashboard = () => setAppView({ mode: 'dashboard' })
-
   const isStatements = appView.mode === 'statements'
+
+  // ── Show user switcher if not logged in ────────────────────────────────────
+  if (!currentUser) {
+    return <UserSwitcher onLogin={handleLogin} />
+  }
 
   return (
     <div className="min-h-screen bg-surface">
 
-      {/* Sidebar backdrop — always in DOM so opacity transition works */}
+      {/* Sidebar backdrop */}
       <div
         className={`fixed inset-0 z-30 bg-black/20 transition-opacity duration-200 ${
           sidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'
@@ -127,7 +163,6 @@ export default function App() {
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        {/* Sidebar header */}
         <div className="flex items-center justify-between px-4 h-16 border-b border-surface-border flex-shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="w-7 h-7 bg-primary rounded-lg flex items-center justify-center flex-shrink-0">
@@ -149,10 +184,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Sidebar body */}
         <nav className="flex-1 overflow-y-auto py-4">
-
-          {/* Dashboard link */}
           <div className="px-2 mb-2">
             <button
               onClick={() => { goToDashboard(); setSidebarOpen(false) }}
@@ -169,7 +201,6 @@ export default function App() {
             </button>
           </div>
 
-          {/* Statements section */}
           <div className="mx-4 mt-3 mb-3 border-t border-surface-border" />
           <div className="px-4 pb-1">
             <p className="text-xs font-semibold uppercase tracking-widest text-text-faint">Statements</p>
@@ -186,15 +217,10 @@ export default function App() {
                     key={acct.id}
                     onClick={() => openStatements(acct)}
                     className={`w-full flex items-start gap-2.5 px-3 py-2 rounded-lg text-left transition-colors ${
-                      isActive
-                        ? 'bg-primary-light text-primary'
-                        : 'text-text hover:bg-surface-hover'
+                      isActive ? 'bg-primary-light text-primary' : 'text-text hover:bg-surface-hover'
                     }`}
                   >
-                    <span
-                      className="w-2 h-2 rounded-full flex-shrink-0 mt-1.5"
-                      style={{ backgroundColor: acct.color }}
-                    />
+                    <span className="w-2 h-2 rounded-full flex-shrink-0 mt-1.5" style={{ backgroundColor: acct.color }} />
                     <div className="min-w-0">
                       <p className="text-xs font-medium truncate leading-tight">
                         {acct.name}{acct.last4 ? ` ···${acct.last4}` : ''}
@@ -211,7 +237,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Future sections */}
           <div className="px-4 pt-5 pb-1">
             <p className="text-xs font-semibold uppercase tracking-widest text-text-faint">Coming Soon</p>
           </div>
@@ -222,20 +247,42 @@ export default function App() {
                 className="flex items-center justify-between px-3 py-2 rounded-lg text-sm text-text-faint cursor-not-allowed select-none"
               >
                 <span>{label}</span>
-                <span className="text-[10px] px-1.5 py-0.5 bg-surface rounded-full border border-surface-border text-text-faint">
-                  soon
-                </span>
+                <span className="text-[10px] px-1.5 py-0.5 bg-surface rounded-full border border-surface-border text-text-faint">soon</span>
               </div>
             ))}
           </div>
         </nav>
+
+        {/* Current user + actions at sidebar bottom */}
+        <div className="px-4 py-3 border-t border-surface-border flex items-center gap-2.5">
+          <div
+            className="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-bold flex-shrink-0"
+            style={{ backgroundColor: currentUser.avatar_color }}
+          >
+            {getInitials(currentUser.name)}
+          </div>
+          <span className="text-sm text-text truncate flex-1">{currentUser.name}</span>
+          <button
+            onClick={() => { setSidebarOpen(false); setShowEditProfile(true) }}
+            className="text-xs text-text-muted hover:text-text transition-colors px-2 py-1 rounded-md hover:bg-surface-hover"
+            aria-label="Edit profile"
+          >
+            Edit
+          </button>
+          <button
+            onClick={() => { setSidebarOpen(false); handleSwitchUser() }}
+            className="text-xs text-text-muted hover:text-text transition-colors px-2 py-1 rounded-md hover:bg-surface-hover"
+            aria-label="Switch profile"
+          >
+            Switch
+          </button>
+        </div>
       </aside>
 
       {/* Header */}
-      <header className="bg-surface-card border-b-[3px] border-primary sticky top-0 z-10 shadow-sm">
+      <header className="bg-surface-card border-b-[3px] border-primary sticky top-0 z-20 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
-            {/* Hamburger + Logo */}
             <div className="flex items-center gap-3">
               <button
                 onClick={() => setSidebarOpen(o => !o)}
@@ -260,7 +307,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Navigation — hidden in statements view */}
             {!isStatements && (
               <div className="flex items-center gap-2">
                 <div className="flex rounded-lg border border-surface-border overflow-hidden" role="group" aria-label="View mode">
@@ -268,24 +314,16 @@ export default function App() {
                     onClick={() => setViewMode('month')}
                     aria-pressed={viewMode === 'month'}
                     className={`px-3 py-1.5 text-sm font-medium transition-colors ${
-                      viewMode === 'month'
-                        ? 'bg-primary text-white'
-                        : 'bg-surface-card text-text-muted hover:bg-surface-hover'
+                      viewMode === 'month' ? 'bg-primary text-white' : 'bg-surface-card text-text-muted hover:bg-surface-hover'
                     }`}
-                  >
-                    Month
-                  </button>
+                  >Month</button>
                   <button
                     onClick={() => setViewMode('year')}
                     aria-pressed={viewMode === 'year'}
                     className={`px-3 py-1.5 text-sm font-medium transition-colors ${
-                      viewMode === 'year'
-                        ? 'bg-primary text-white'
-                        : 'bg-surface-card text-text-muted hover:bg-surface-hover'
+                      viewMode === 'year' ? 'bg-primary text-white' : 'bg-surface-card text-text-muted hover:bg-surface-hover'
                     }`}
-                  >
-                    Year
-                  </button>
+                  >Year</button>
                 </div>
 
                 {viewMode === 'month' ? (
@@ -295,23 +333,13 @@ export default function App() {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
                       </svg>
                     </button>
-                    <select
-                      value={month}
-                      onChange={e => setMonth(Number(e.target.value))}
-                      className="text-sm font-semibold text-text border border-surface-border rounded-lg px-2 py-1.5 bg-surface-card focus:outline-none focus:ring-2 focus:ring-primary"
-                    >
-                      {MONTH_NAMES.map((name, i) => (
-                        <option key={i + 1} value={i + 1}>{name}</option>
-                      ))}
+                    <select value={month} onChange={e => setMonth(Number(e.target.value))}
+                      className="text-sm font-semibold text-text border border-surface-border rounded-lg px-2 py-1.5 bg-surface-card focus:outline-none focus:ring-2 focus:ring-primary">
+                      {MONTH_NAMES.map((name, i) => <option key={i + 1} value={i + 1}>{name}</option>)}
                     </select>
-                    <select
-                      value={year}
-                      onChange={e => setYear(Number(e.target.value))}
-                      className="text-sm font-semibold text-text border border-surface-border rounded-lg px-2 py-1.5 bg-surface-card focus:outline-none focus:ring-2 focus:ring-primary"
-                    >
-                      {availableYears.map(y => (
-                        <option key={y} value={y}>{y}</option>
-                      ))}
+                    <select value={year} onChange={e => setYear(Number(e.target.value))}
+                      className="text-sm font-semibold text-text border border-surface-border rounded-lg px-2 py-1.5 bg-surface-card focus:outline-none focus:ring-2 focus:ring-primary">
+                      {availableYears.map(y => <option key={y} value={y}>{y}</option>)}
                     </select>
                     <button onClick={nextMonth} className="p-2.5 md:p-1.5 rounded-lg hover:bg-surface-hover text-text-muted focus:outline-none focus:ring-2 focus:ring-primary" aria-label="Next month">
                       <svg aria-hidden="true" className="w-5 h-5 md:w-4 md:h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -320,21 +348,55 @@ export default function App() {
                     </button>
                   </div>
                 ) : (
-                  <select
-                    value={year}
-                    onChange={(e) => setYear(Number(e.target.value))}
-                    className="text-sm font-medium border border-surface-border rounded-lg px-3 py-1.5 bg-surface-card text-text focus:outline-none focus:ring-2 focus:ring-primary"
-                  >
-                    {availableYears.map((y) => (
-                      <option key={y} value={y}>{y}</option>
-                    ))}
+                  <select value={year} onChange={e => setYear(Number(e.target.value))}
+                    className="text-sm font-medium border border-surface-border rounded-lg px-3 py-1.5 bg-surface-card text-text focus:outline-none focus:ring-2 focus:ring-primary">
+                    {availableYears.map(y => <option key={y} value={y}>{y}</option>)}
                   </select>
                 )}
               </div>
             )}
 
-            {/* Right actions */}
             <div className="flex items-center gap-2">
+              {/* Current user avatar in header — click to open menu */}
+              <div className="relative">
+                <button
+                  onClick={() => setAvatarMenuOpen(o => !o)}
+                  title={currentUser.name}
+                  className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold hover:opacity-80 transition-opacity focus:outline-none focus:ring-2 focus:ring-primary"
+                  style={{ backgroundColor: currentUser.avatar_color }}
+                >
+                  {getInitials(currentUser.name)}
+                </button>
+                {avatarMenuOpen && (
+                  <>
+                    <div className="fixed inset-0 z-20" onClick={() => setAvatarMenuOpen(false)} aria-hidden="true" />
+                    <div className="absolute right-0 top-10 z-30 w-44 bg-surface-card border border-surface-border rounded-xl shadow-lg py-1 overflow-hidden">
+                      <div className="px-3 py-2 border-b border-surface-border">
+                        <p className="text-xs font-semibold text-text truncate">{currentUser.name}</p>
+                      </div>
+                      <button
+                        onClick={() => { setAvatarMenuOpen(false); setShowEditProfile(true) }}
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-text hover:bg-surface-hover transition-colors text-left"
+                      >
+                        <svg className="w-4 h-4 text-text-muted flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536M9 13l6.586-6.586a2 2 0 112.828 2.828L11.828 15.828A2 2 0 0110 16H8v-2a2 2 0 01.586-1.414z" />
+                        </svg>
+                        Edit Profile
+                      </button>
+                      <button
+                        onClick={() => { setAvatarMenuOpen(false); handleSwitchUser() }}
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-text hover:bg-surface-hover transition-colors text-left"
+                      >
+                        <svg className="w-4 h-4 text-text-muted flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                        </svg>
+                        Switch User
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+
               <button
                 onClick={() => setIsDark(d => !d)}
                 aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
@@ -380,17 +442,9 @@ export default function App() {
       {/* Main content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {appView.mode === 'statements' ? (
-          <StatementsView
-            account={appView.account}
-            onBack={goToDashboard}
-          />
+          <StatementsView account={appView.account} onBack={goToDashboard} />
         ) : (
-          <Dashboard
-            key={refreshKey}
-            year={year}
-            month={month}
-            viewMode={viewMode}
-          />
+          <Dashboard key={refreshKey} year={year} month={month} viewMode={viewMode} />
         )}
       </main>
 
@@ -398,13 +452,16 @@ export default function App() {
         <UploadModal onClose={() => setShowUpload(false)} onDone={handleUploadDone} />
       )}
       {showManage && (
-        <ManageModal
-          onClose={() => setShowManage(false)}
-          onChanged={() => setRefreshKey(k => k + 1)}
+        <ManageModal onClose={() => setShowManage(false)} onChanged={() => setRefreshKey(k => k + 1)} />
+      )}
+      {showEditProfile && currentUser && (
+        <EditProfileModal
+          user={currentUser}
+          onClose={() => setShowEditProfile(false)}
+          onUpdated={updated => setCurrentUserState(updated)}
         />
       )}
 
-      {/* Scroll-to-top button */}
       <button
         onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
         aria-label="Back to top"
